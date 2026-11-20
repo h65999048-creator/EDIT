@@ -1,32 +1,30 @@
-# Dependencies: pip install pyTelegramBotAPI google-genai flask gunicorn
+# Dependencies: pip install pyTelegramBotAPI opencv-python-headless numpy flask gunicorn
 
 import os
 import json
 import time
 import uuid
 import subprocess
+import cv2
+import numpy as np
 from pathlib import Path
 from typing import Optional
 
 import telebot
 from telebot.types import Message
-from google import genai
-from google.genai import types
 from flask import Flask, request, abort
 
 # ============================================================
-# HARDCODED KEYS (Teri di hui keys)
+# HARDCODED BOT TOKEN
 # ============================================================
 BOT_TOKEN = "8500798158:AAFbxISethamvuchRUSlfc7qsZLeZTf_3pU"
-GEMINI_API_KEY = "AQ.Ab8RN6L4tOkPcinBwkejIARuOuiMiS2oE8xJR6uPD2fEW4xPEg"
 # ============================================================
 
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
-if not BOT_TOKEN or not GEMINI_API_KEY:
-    raise SystemExit("BOT_TOKEN ya GEMINI_API_KEY missing hai.")
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN missing hai.")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
 bot = telebot.TeleBot(BOT_TOKEN)
 
 WORK_DIR = Path.home() / "vbot_work"
@@ -60,128 +58,125 @@ def probe_video(path: str) -> dict:
         return {"error": "parse failed"}
 
 
-def upload_video_to_gemini(path: str) -> Optional[object]:
-    try:
-        vf = client.files.upload(file=path)
-        while vf.state.name == "PROCESSING":
-            time.sleep(3)
-            vf = client.files.get(name=vf.name)
-        return vf if vf.state.name == "ACTIVE" else None
-    except Exception as e:
-        print(f"Gemini upload error: {e}")
-        return None
+def detect_scenes_opencv(video_path: str) -> list[dict]:
+    """OpenCV ka use karke video ke cuts/scenes detect karta hai (Bina AI ke)"""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps == 0:
+        fps = 30.0
+        
+    scene_list = []
+    prev_frame = None
+    frame_count = 0
+    threshold = 40.0  # Cut detect karne ka threshold
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Frame ko chhota aur grayscale karo processing ke liye
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (320, 180))
+
+        if prev_frame is not None:
+            # Frames ka difference nikalo
+            diff = cv2.absdiff(prev_frame, gray)
+            mean_diff = np.mean(diff)
+
+            # Agar difference threshold se zyada hai, to scene change hai
+            if mean_diff > threshold:
+                timestamp = frame_count / fps
+                scene_list.append({
+                    "scene": len(scene_list) + 1,
+                    "start_sec": round(timestamp, 2)
+                })
+
+        prev_frame = gray
+        frame_count += 1
+
+    cap.release()
+    
+    # Scene start times ko duration mein convert karo
+    for i in range(len(scene_list)):
+        if i < len(scene_list) - 1:
+            scene_list[i]["end_sec"] = scene_list[i+1]["start_sec"]
+        else:
+            # Last scene ka end video ki duration hoga
+            cap = cv2.VideoCapture(video_path)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            duration = total_frames / fps if fps > 0 else 0
+            cap.release()
+            scene_list[i]["end_sec"] = round(duration, 2)
+            
+        scene_list[i]["duration"] = round(scene_list[i]["end_sec"] - scene_list[i]["start_sec"], 2)
+
+    return scene_list
 
 
-def analyze_reference(video_file, user_prompt: str) -> Optional[dict]:
-    prompt = f"""
-You are a professional video editor. Analyze this reference video CAREFULLY.
-User's intent: {user_prompt}
+def apply_edits_to_clip(clip_path: str, output_path: str, ref_scenes: list[dict]) -> bool:
+    """Reference video ke scenes ke hisaab se clip ko cut karta hai"""
+    clip_info = probe_video(clip_path)
+    if "error" in clip_info:
+        return False
 
-Return STRICT JSON only, no markdown:
-{{
-  "total_duration_sec": <float>,
-  "scene_count": <int>,
-  "scenes": [
-    {{"start_sec": <float>, "end_sec": <float>, "description": "<what happens>",
-      "camera_movement": "<static/pan/zoom/handheld>", "color_tone": "<warm/cool/neutral/high-contrast>",
-      "transition_to_next": "<cut/fade/dissolve/none>"}}
-  ],
-  "music_mood": "<energetic/calm/dramatic/happy/none>",
-  "editing_pace": "<fast/medium/slow>",
-  "text_overlays": <true/false>,
-  "overall_style": "<brief summary>"
-}}
-"""
-    try:
-        resp = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=[video_file, prompt],
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        text = resp.text.strip()
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-        return json.loads(text.strip())
-    except Exception as e:
-        print(f"Analysis error: {e}")
-        return None
+    clip_duration = float(clip_info.get("format", {}).get("duration", 0))
+    if clip_duration <= 0 or not ref_scenes:
+        return False
 
+    # Clip ko reference scenes ki length ke hisaab se cut karne ki koshish
+    # Hum ek temporary file banayenge jisme sirf cut parts honge
+    parts = []
+    current_time = 0.0
 
-def generate_edit_plan(analysis: dict, clip_info: dict) -> Optional[dict]:
-    prompt = f"""
-Reference analysis: {json.dumps(analysis)}
-My clip info: {json.dumps(clip_info)}
+    for scene in ref_scenes:
+        duration_needed = scene["duration"]
+        
+        # Agar clip mein itna time bacha hai
+        if current_time < clip_duration:
+            # Cut ki duration clip ke bache hue time se badi nahi honi chahiye
+            actual_duration = min(duration_needed, clip_duration - current_time)
+            if actual_duration <= 0.1:
+                continue
+                
+            part_file = str(WORK_DIR / f"part_{uuid.uuid4().hex[:6]}.mp4")
+            
+            # FFmpeg se clip ka ek part kaato
+            cmd = [
+                "ffmpeg", "-y", "-ss", str(current_time), "-i", clip_path, 
+                "-t", str(actual_duration), "-c", "copy", part_file
+            ]
+            ok, _ = run_cmd(cmd)
+            if ok and os.path.exists(part_file):
+                parts.append(part_file)
+            current_time += actual_duration
 
-Return STRICT JSON edit plan, no markdown:
-{{
-  "operations": [
-    {{"type": "trim", "start_sec": <f>, "end_sec": <f>, "reason": "<why>"}},
-    {{"type": "setpts", "speed_factor": <0.5-2.0>, "reason": "<why>"}},
-    {{"type": "eq", "brightness": <-1..1>, "contrast": <0..2>, "saturation": <0..2>, "reason": "<why>"}}
-  ],
-  "output_notes": "<what final should look like>"
-}}
-Rules: Only types trim/setpts/eq. Max 5 ops. Be realistic with clip duration.
-"""
-    try:
-        resp = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        text = resp.text.strip()
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-        return json.loads(text.strip())
-    except Exception as e:
-        print(f"Plan error: {e}")
-        return None
+    if not parts:
+        return False
 
+    # Saare cut parts ko wapas jodo
+    concat_file = str(WORK_DIR / "concat.txt")
+    with open(concat_file, "w") as f:
+        for p in parts:
+            f.write(f"file '{p}'\n")
 
-def apply_edit_plan(input_path: str, output_path: str, plan: dict) -> bool:
-    vfilters, afilters = [], []
-    trim = None
-    speed = 1.0
-    for op in plan.get("operations", []):
-        t = op.get("type")
-        if t == "trim":
-            trim = (float(op.get("start_sec", 0)), float(op.get("end_sec", 0)))
-        elif t == "setpts":
-            speed = max(0.5, min(2.0, float(op.get("speed_factor", 1.0))))
-        elif t == "eq":
-            vfilters.append(
-                f"eq=brightness={op.get('brightness',0)}:"
-                f"contrast={op.get('contrast',1)}:"
-                f"saturation={op.get('saturation',1)}"
-            )
+    concat_cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", 
+        "-i", concat_file, "-c", "copy", output_path
+    ]
+    ok, _ = run_cmd(concat_cmd)
 
-    if speed != 1.0:
-        vfilters.insert(0, f"setpts={1/speed}*PTS")
-        afilters.append(f"atempo={speed}")
+    # Cleanup parts
+    for p in parts:
+        try: os.remove(p)
+        except: pass
+    try: os.remove(concat_file)
+    except: pass
 
-    if trim:
-        dur = trim[1] - trim[0]
-        if dur <= 0:
-            return False
-        cmd = ["ffmpeg", "-y", "-ss", str(trim[0]), "-i", input_path, "-t", str(dur)]
-    else:
-        cmd = ["ffmpeg", "-y", "-i", input_path]
-
-    if vfilters:
-        cmd += ["-vf", ",".join(vfilters)]
-    if afilters:
-        cmd += ["-af", ",".join(afilters)]
-
-    cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k", "-pix_fmt", "yuv420p", output_path]
-
-    ok, err = run_cmd(cmd)
-    if not ok:
-        print(f"ffmpeg error: {err}")
     return ok
 
 
@@ -192,7 +187,7 @@ def cmd_start(m: Message):
         "Boss man, workflow:\n"
         "1. /reference bhej + reference video\n"
         "2. /clip bhej + apni clip\n"
-        "3. /render — Gemini analyze + ffmpeg edit\n\n"
+        "3. /render — OpenCV se cuts match karega\n\n"
         "Commands: /reference /clip /render /status")
 
 
@@ -258,37 +253,25 @@ def cmd_render(m: Message):
         bot.reply_to(m, "Reference + clip dono chahiye.")
         return
 
-    bot.reply_to(m, "⏳ Gemini analyze kar raha hai...")
-    vf = upload_video_to_gemini(ref)
-    if not vf:
-        bot.reply_to(m, "Gemini upload fail.")
+    bot.reply_to(m, "⏳ Reference video ke scenes detect ho rahe hain (OpenCV)...")
+    
+    # 1. Reference se scenes nikaalo
+    ref_scenes = detect_scenes_opencv(ref)
+    if not ref_scenes:
+        bot.reply_to(m, "Reference video mein koi clear cuts nahi mile.")
         return
 
-    analysis = analyze_reference(vf, "Match style, cuts, color tone, pace.")
-    if not analysis:
-        bot.reply_to(m, "Analysis fail.")
-        return
+    bot.reply_to(m, f"✅ {len(ref_scenes)} scenes detect hue. Ab teri clip edit ho rahi hai...")
 
-    bot.reply_to(m, f"✅ {analysis.get('scene_count','?')} scenes | style: {analysis.get('overall_style','?')}")
-
-    clip_info = probe_video(clip)
-    if "error" in clip_info:
-        bot.reply_to(m, f"Clip probe fail: {clip_info['error']}")
-        return
-
-    plan = generate_edit_plan(analysis, clip_info)
-    if not plan:
-        bot.reply_to(m, "Edit plan fail.")
-        return
-
+    # 2. Clip ko edit karo
     out = str(WORK_DIR / f"out_{uuid.uuid4().hex[:8]}.mp4")
-    ok = apply_edit_plan(clip, out, plan)
+    ok = apply_edits_to_clip(clip, out, ref_scenes)
 
     if ok and os.path.exists(out):
         with open(out, "rb") as v:
-            bot.send_video(m.chat.id, v, caption=f"Style: {analysis.get('overall_style','N/A')}")
+            bot.send_video(m.chat.id, v, caption="Boss man, OpenCV se edit kiya hua video ready hai.")
     else:
-        bot.reply_to(m, "Render fail.")
+        bot.reply_to(m, "Render fail ho gaya. Check karo ki clip reference se lambi hai ya nahi.")
 
 
 @app.route(WEBHOOK_PATH, methods=["POST"])
@@ -317,8 +300,6 @@ if __name__ == "__main__":
         time.sleep(1)
         bot.set_webhook(url=webhook_url)
         print(f"Webhook set: {webhook_url}")
-    else:
-        print("RENDER_EXTERNAL_URL nahi mila, webhook set nahi hua.")
-
+    
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
