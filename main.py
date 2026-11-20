@@ -5,7 +5,6 @@ import json
 import time
 import uuid
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -16,24 +15,24 @@ from google.genai import types
 from flask import Flask, request, abort
 
 # ============================================================
-# Render Environment Variables se keys aayengi
+# HARDCODED KEYS (Teri di hui keys)
 # ============================================================
-BOT_TOKEN = os.environ.get("8500798158:AAFbxISethamvuchRUSlfc7qsZLeZTf_3pU", "")
-GEMINI_API_KEY = os.environ.get("AQ.Ab8RN6L4tOkPcinBwkejIARuOuiMiS2oE8xJR6uPD2fEW4xPEg", "")
+BOT_TOKEN = "8500798158:AAFbxISethamvuchRUSlfc7qsZLeZTf_3pU"
+GEMINI_API_KEY = "AQ.Ab8RN6L4tOkPcinBwkejIARuOuiMiS2oE8xJR6uPD2fEW4xPEg"
+# ============================================================
+
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
 if not BOT_TOKEN or not GEMINI_API_KEY:
-    raise SystemExit("BOT_TOKEN aur GEMINI_API_KEY environment variables set kar.")
+    raise SystemExit("BOT_TOKEN ya GEMINI_API_KEY missing hai.")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Render ka /tmp persistent nahi hota, isliye home mein work dir bana
 WORK_DIR = Path.home() / "vbot_work"
 WORK_DIR.mkdir(exist_ok=True)
 USER_STATE: dict[int, dict] = {}
 
-# Flask app webhook ke liye
 app = Flask(__name__)
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 
@@ -186,8 +185,6 @@ def apply_edit_plan(input_path: str, output_path: str, plan: dict) -> bool:
     return ok
 
 
-# ============ BOT HANDLERS ============
-
 @bot.message_handler(commands=["start"])
 def cmd_start(m: Message):
     USER_STATE[m.chat.id] = {}
@@ -294,8 +291,6 @@ def cmd_render(m: Message):
         bot.reply_to(m, "Render fail.")
 
 
-# ============ WEBHOOK ENDPOINTS ============
-
 @app.route(WEBHOOK_PATH, methods=["POST"])
 def webhook():
     if request.headers.get("content-type") != "application/json":
@@ -315,10 +310,7 @@ def index():
     return "Bot is running", 200
 
 
-# ============ STARTUP ============
-
 if __name__ == "__main__":
-    # Webhook set karo
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
         bot.remove_webhook()
